@@ -1,0 +1,233 @@
+import wx
+
+MATERIALS = {
+    "PLA": {"ideal_temp":210,"speed_factor":1.0,"quality_factor":1.0,"colour":wx.Colour(0,180,0)},
+    "PETG": {"ideal_temp":240,"speed_factor":0.9,"quality_factor":0.95,"colour":wx.Colour(0,140,255)},
+    "ABS": {"ideal_temp":250,"speed_factor":0.8,"quality_factor":0.90,"colour":wx.Colour(255,140,0)},
+    "TPU": {"ideal_temp":225,"speed_factor":0.5,"quality_factor":0.85,"colour":wx.Colour(180,0,255)},
+}
+
+MODEL_HEIGHT_MM = 40
+MODEL_HEIGHT_PIXELS = 350
+
+class PrinterSettings:
+    def __init__(self):
+        self.temperature = 210
+        self.speed = 60
+        self.layer_height = 0.20
+        self.supports = True
+        self.material = 'PLA'
+
+
+def calculate_total_layers(settings):
+    return max(1, int(MODEL_HEIGHT_MM / settings.layer_height))
+
+
+def calculate_quality(settings):
+    ideal = MATERIALS[settings.material]['ideal_temp']
+    q = 100
+    q -= abs(settings.temperature - ideal) * 1.1
+    q -= max(0, settings.speed - 80) * 0.25
+    q *= MATERIALS[settings.material]['quality_factor']
+    return max(0, int(q))
+
+
+def estimate_time(settings):
+    layers = calculate_total_layers(settings)
+    mins = layers * (100 / max(1, settings.speed))
+    mins /= MATERIALS[settings.material]['speed_factor']
+    return int(mins)
+
+class SimulationEngine:
+    def __init__(self):
+        self.current_layer = 0
+        self.running = False
+        self.failed = False
+        self.finished = False
+        self.failure_reason = ''
+        self.overhang_sag = 0
+
+    def start(self): self.running = True
+    def pause(self): self.running = False
+
+    def reset(self):
+        self.__init__()
+
+    def update(self, settings):
+        if not self.running or self.failed or self.finished:
+            return
+        total = calculate_total_layers(settings)
+        self.current_layer += settings.speed / 120
+        ideal = MATERIALS[settings.material]['ideal_temp']
+        if abs(settings.temperature - ideal) > 50:
+            self.failed = True
+            self.failure_reason = 'Temperature Failure: Nozzle Clog'
+        progress = self.current_layer / total
+        if progress > 0.7 and not settings.supports:
+            self.overhang_sag += 0.5
+            if self.overhang_sag > 35:
+                self.failed = True
+                self.failure_reason = 'Overhang Collapse'
+        if self.current_layer >= total:
+            self.current_layer = total
+            self.finished = True
+            self.running = False
+
+class PrintPanel(wx.Panel):
+    def __init__(self, parent, settings, sim):
+        super().__init__(parent)
+        self.settings = settings
+        self.sim = sim
+        self.Bind(wx.EVT_PAINT, self.on_paint)
+
+    def draw_bed(self, dc):
+        dc.SetBrush(wx.Brush(wx.Colour(220,220,220)))
+        dc.DrawRectangle(150, 500, 500, 40)
+
+    def draw_supports(self, dc, printed_height):
+        if not self.settings.supports:
+            return
+        c = wx.Colour(255,165,0)
+        dc.SetBrush(wx.Brush(c)); dc.SetPen(wx.Pen(c))
+        support_height = min(printed_height, 250)
+        top = 500 - support_height
+        for x in [315,380,445]:
+            dc.DrawRectangle(x, int(top), 15, int(support_height))
+            if support_height > 180:
+                dc.DrawRectangle(x-20, int(top), 55, 10)
+
+    def draw_model(self, dc, total):
+        colour = MATERIALS[self.settings.material]['colour']
+        dc.SetBrush(wx.Brush(colour))
+        dc.SetPen(wx.Pen(colour))
+
+        completed = int(self.sim.current_layer)
+        lpx = MODEL_HEIGHT_PIXELS / total
+
+        for layer in range(completed):
+            progress = layer / total
+            y = 500 - (layer + 1) * lpx
+
+            width = 120
+            if progress > 0.70:
+                width = 240
+
+            x = 400 - width // 2
+
+            # Simulate overhang sag without shifting every layer
+            if progress > 0.70 and self.sim.overhang_sag > 0:
+                x += int(self.sim.overhang_sag)
+
+            dc.DrawRectangle(
+                int(x),
+                int(y),
+                width,
+                max(1, int(lpx))
+        )
+
+    def draw_nozzle(self, dc, total):
+        progress = self.sim.current_layer / total
+        y = 500 - progress * MODEL_HEIGHT_PIXELS
+        dc.SetBrush(wx.Brush('black'))
+        dc.DrawCircle(400, int(y), 12)
+
+    def on_paint(self, evt):
+        dc = wx.PaintDC(self)
+        dc.Clear()
+        total = calculate_total_layers(self.settings)
+        progress = min(self.sim.current_layer, total) / total
+        printed_height = progress * MODEL_HEIGHT_PIXELS
+        self.draw_bed(dc)
+        self.draw_supports(dc, printed_height)
+        self.draw_model(dc, total)
+        self.draw_nozzle(dc, total)
+        if self.sim.failed:
+            dc.SetTextForeground(wx.RED)
+            dc.DrawText('PRINT FAILED', 300, 40)
+            dc.DrawText(self.sim.failure_reason, 300, 65)
+        elif self.sim.finished:
+            dc.SetTextForeground(wx.GREEN)
+            dc.DrawText('PRINT COMPLETE', 300, 40)
+
+class MainFrame(wx.Frame):
+    def __init__(self):
+        super().__init__(None, title='3D Printer Simulator', size=(1100,700))
+        self.settings = PrinterSettings()
+        self.sim = SimulationEngine()
+        self.build_ui()
+        self.sync_settings()
+        self.update_slider_labels()
+        self.timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, self.on_timer)
+        self.timer.Start(30)
+        self.Show()
+
+    def build_ui(self):
+        panel = wx.Panel(self)
+        main = wx.BoxSizer(wx.HORIZONTAL)
+        controls = wx.BoxSizer(wx.VERTICAL)
+
+        self.temp_label = wx.StaticText(panel)
+        controls.Add(self.temp_label)
+        self.temp = wx.Slider(panel, value=210, minValue=150, maxValue=280)
+        controls.Add(self.temp)
+
+        self.speed_label = wx.StaticText(panel)
+        controls.Add(self.speed_label)
+        self.speed = wx.Slider(panel, value=60, minValue=20, maxValue=200)
+        controls.Add(self.speed)
+
+        self.layer_label = wx.StaticText(panel)
+        controls.Add(self.layer_label)
+        self.layer = wx.Slider(panel, value=20, minValue=5, maxValue=40)
+        controls.Add(self.layer)
+
+        self.supports = wx.CheckBox(panel, label='Supports'); self.supports.SetValue(True)
+        controls.Add(self.supports)
+
+        controls.Add(wx.StaticText(panel, label='Material'))
+        self.material = wx.Choice(panel, choices=list(MATERIALS.keys()))
+        self.material.SetSelection(0)
+        controls.Add(self.material)
+
+        for text, handler in [('Start', self.start), ('Pause', self.pause), ('Reset', self.reset)]:
+            b = wx.Button(panel, label=text)
+            b.Bind(wx.EVT_BUTTON, handler)
+            controls.Add(b)
+
+        self.stats = wx.StaticText(panel)
+        controls.Add(self.stats)
+
+        self.canvas = PrintPanel(panel, self.settings, self.sim)
+        main.Add(controls, 0, wx.ALL, 10)
+        main.Add(self.canvas, 1, wx.EXPAND | wx.ALL, 10)
+        panel.SetSizer(main)
+
+    def sync_settings(self):
+        self.settings.temperature = self.temp.GetValue()
+        self.settings.speed = self.speed.GetValue()
+        self.settings.layer_height = self.layer.GetValue()/100
+        self.settings.supports = self.supports.GetValue()
+        self.settings.material = self.material.GetStringSelection()
+
+    def update_slider_labels(self):
+        self.temp_label.SetLabel(f'Temperature: {self.settings.temperature}°C (150-280°C)')
+        self.speed_label.SetLabel(f'Speed: {self.settings.speed} mm/s (20-200)')
+        self.layer_label.SetLabel(f'Layer Height: {self.settings.layer_height:.2f} mm (0.05-0.40)')
+
+    def update_stats(self):
+        total = calculate_total_layers(self.settings)
+        prog = int(min(self.sim.current_layer,total)/total*100)
+        self.stats.SetLabel(f'Quality: {calculate_quality(self.settings)}%\n\nEstimated Time: {estimate_time(self.settings)} mins\n\nLayers: {total}\n\nProgress: {prog}%')
+
+    def on_timer(self, e):
+        self.sync_settings(); self.update_slider_labels(); self.sim.update(self.settings); self.update_stats(); self.canvas.Refresh()
+
+    def start(self,e): self.sim.start()
+    def pause(self,e): self.sim.pause()
+    def reset(self,e): self.sim.reset()
+
+if __name__ == '__main__':
+    app = wx.App()
+    MainFrame()
+    app.MainLoop()
